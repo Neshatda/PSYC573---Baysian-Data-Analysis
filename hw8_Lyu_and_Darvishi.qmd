@@ -1,0 +1,245 @@
+---
+title: "HW 8"
+author: "Zoey Zixi Lyu & Neshat Darvishi"
+date: "`r Sys.Date()`"
+echo: false
+format:
+  gfm:
+    toc: true
+    html-math-method: webtex
+output: github_document
+---
+
+```{r}
+#| message: false
+library(tidyverse)
+library(here)
+library(modelsummary)  # for summarizing data
+library(cmdstanr)  # use two cores
+library(posterior)
+library(bayesplot)
+library(ggplot2)
+library(brms)
+options(brms.backend = "cmdstanr")
+```
+
+# Research Question
+
+> Can the acquisition of non-adjacent dependencies be facilitated by pairing 
+> them with either matching or non-matching acoustic cues?
+
+
+# Variables
+
+- `id`: ID for participant 
+- `testSlider.response`: respond from participants ranking their familiarity level from 1 (not familiar at all) to 5 (very familiar)
+- `stim`: stimuli type, rule: stimuli following NAD rule; class: stimuli is positional; catch: stimuli for attention check
+- `trial_number`: order number of test trial
+- `study_condition`: 5 study conditions: silent; wave-sound; speech; wave-sound that mismatch the NAD rule; speech that mismatch the NAD rule
+
+## Data Import
+The data is in raw format and needs pre-processing.
+
+### Read Raw Data
+```{r read in all data}
+#| message: false
+silent_data <- list.files(path="./data/silent data", pattern="*.csv", 
+                          full.names=T, recursive=T) |>
+    lapply(read_csv) |> bind_rows()
+silent_data <- silent_data  |>
+  select(c("id","testslider.response","stimType", "stim", "order")) |>
+  drop_na() |> mutate(study_condition = "silent") |>
+  rename("stim" = "stimType", "stimType" = "stim") |> # rename wrong col name
+  select(-c("stimType"))
+
+acoustic_data <- list.files(path="./data/acoustic data", pattern="*.csv", 
+                          full.names=T, recursive=T) |>
+    lapply(read_csv) |> bind_rows()
+acoustic_data <- acoustic_data |>
+  select(c("id","testSlider.response","stim","order","condition"))|>
+  drop_na()|>
+  mutate(
+    study_condition = case_when(condition%%2==1 ~ "speech", 
+                                condition%%2==0 ~ "tone")) |>
+  select(-c("condition"))
+
+acoustic_mismatch_data <- list.files(path="./data/acoustic data_mismatch", pattern="*.csv", 
+                          full.names=T, recursive=T) |>
+    lapply(read_csv) |> bind_rows()
+acoustic_mismatch_data <- acoustic_mismatch_data |>
+  select(c("id","testSlider.response","stim","order","condition"))|>
+  drop_na()|>
+  mutate(
+    study_condition = case_when(condition%%2==1 ~ "speech_mismatch", 
+                                condition%%2==0 ~ "tone_mismatch")) |>
+  select(-c("condition"))
+```
+
+### Combine Data
+```{r combine data}
+# adjust column names
+colnames(silent_data) <- colnames(acoustic_data)
+
+# check for overlapping and remove from consequence study
+remove_overlap <- function(previous_study, this_study){
+  # find overlaps
+  overlapped_ids <- intersect(unique(previous_study$id),unique(this_study$id))
+  # remove from this study
+  this_study_filtered <- this_study |> filter(!id %in% overlapped_ids)
+  return(this_study_filtered)
+}
+
+acoustic_data <- remove_overlap(silent_data, acoustic_data)
+acoustic_mismatch_data <- remove_overlap(silent_data, acoustic_mismatch_data)
+acoustic_mismatch_data <- remove_overlap(acoustic_data, acoustic_mismatch_data)
+
+# bind all data together
+all_data <- do.call(
+  "rbind",list(silent_data, acoustic_data, acoustic_mismatch_data))|> drop_na()
+
+# drop existing data
+rm(silent_data, acoustic_data, acoustic_mismatch_data,remove_overlap)
+```
+
+### Filter Data
+```{r exclusion based on attention check}
+# participants are expected to be very unfamiliar with catch stimuli
+# if a participant answered more than 4 times of >=3 for catch, remove the id
+valid_data_5_cond <- all_data |>
+  group_by(id) |>
+  mutate(catch_gt_3_cnt = sum(stim=="catch" & testSlider.response>=3)) |>
+  ungroup() |>
+  filter(catch_gt_3_cnt <= 4 & stim != "catch") |>
+  select(-c("catch_gt_3_cnt"))
+
+# recalculate the trial order number with removed catch trials
+valid_data_5_cond <- valid_data_5_cond |>
+  mutate(trial_number = rep(1:36, times = nrow(valid_data_5_cond)/36))|>
+  select(-c("order"))
+
+# factorize columns
+valid_data_5_cond <- valid_data_5_cond |>
+  mutate(
+    study_condition=factor(
+      study_condition, 
+      levels=c("silent","tone","speech", "speech_mismatch", "tone_mismatch")),
+    stim = factor(stim, levels=c("class","rule"), labels=c("positional","NAD")))
+```
+To date, a total of `r length(unique(all_data$id))` subjects have been tested. Data from `r length(unique(valid_data_5_cond$id))` subjects could be used (speech = `r length(unique(filter(valid_data_5_cond, study_condition == "speech")$id))`, tone = `r length(unique(filter(valid_data_5_cond, study_condition == "tone")$id))`, speech_mismatch = `r length(unique(filter(valid_data_5_cond, study_condition == "speech_mismatch")$id))`, tone_mismatch = `r length(unique(filter(valid_data_5_cond, study_condition == "tone_mismatch")$id))`, silent = `r length(unique(filter(valid_data_5_cond, study_condition == "silent")$id))`). `r length(unique(all_data$id))-length(unique(valid_data_5_cond$id))` subjects have to be excluded because they did not pass the attention check.
+
+
+## Variable Summary
+Table @tbl-summ-var shows the summary statistics of evaluation ratings by groups.
+
+```{r}
+#| label: tbl-summ-var
+#| tbl-cap: Descriptive statistics by groups
+datasummary(Heading("Response")*testSlider.response  * 
+                (N + Mean + SD + Histogram) ~ 
+                study_condition*stim,
+            data = valid_data_5_cond)
+```
+
+# Model
+
+Let $Y$ = `testSlider.response`, $C$ = `study_condition`, $S$ = `stim`, $T$ = `trial_number`, $ID$ = `id`
+
+Since we are using a cumulative logit link model, we have 4 cuts $c_{1}<c_{2}<c_{3}<c_{4}$ to separate $Y$ into 5 levels 
+$$
+  \begin{aligned}
+    P(\boldsymbol{Y}\le k) &= \mathrm{logit}^{-1}(\boldsymbol{\eta} - c_k), \quad k=1,2,3,4\\
+  \\
+  \end{aligned}
+$$
+The $\eta$ is the linear predictor:
+$$
+\begin{aligned}
+  \boldsymbol{\eta} &= \boldsymbol{X\beta+Zb}
+  \\
+  \boldsymbol{b_{i}} & \sim N \left(\boldsymbol{0} , \mathrm{diag} \left( \boldsymbol{\tau} \right) \boldsymbol{\Omega} \mathrm{diag} \left( \boldsymbol{\tau} \right)\right) 
+\end{aligned}\\
+$$
+where $\beta$ is the coefficients for fixed effect and $b_{i}$ is the coefficients for random effect for participant $i$
+
+Prior:
+Since we have 4 levels for cutting threshold $c_{k}$, we do not need a separate intercept in the linear part. For $\beta$, 
+we have 4 for `study_condition`, 1 for `stim`, 1 for `trial_number`,
+4 for `study_condition:stim`, 4 for `study_condition:trial_number`, 1 for `stim:trial_number`,
+4 for `study_condition:stim:trial_number`, a total count of 19.
+For $\tau_{l}$, we have the SD for `Intercept`, `stim`, `trial_number`, and `stim:trial_number`.
+For correlation we use LKJ prior.
+$$
+  \begin{aligned}
+    c_{k} & \sim N(0,2), \; k=1,2,3,4 \\
+    \beta_{j} & \sim N(0, 2), \;  j = 1,2,\dots,19\\
+    \tau_{l} & \sim Gamma(2, 2), \; l = 1,2,3,4 \\
+    \boldsymbol{\Omega} & \sim \boldsymbol{lkj}(1)
+  \end{aligned}
+$$
+
+## Analysis
+
+We used 4 chains, each with 4,000 iterations (first 2,000 as warm-ups). 
+
+```{r}
+#| message: false
+#| include: false
+
+#set.seed(42)
+#prior <- c(
+#  prior(normal(0,2), class="Intercept"),
+#  prior(normal(0,2), class="b"),
+#  prior(gamma(2,2), class="sd"),
+#  prior(lkj(1), class="cor")
+#)
+#fit <- brm(testSlider.response ~ study_condition * stim * trial_number
+#           + (stim*trial_number | id), data = valid_data_5_cond, 
+#           family = cumulative, prior = prior,
+#           iter = 4000, chains = 4)
+#saveRDS(fit, "hw8_model.rds")
+
+fit <- readRDS("hw8_model.rds")
+
+```
+
+# Results
+
+As shown in the rank histogram in @fig-rank-hist-fit below, the chains mixed well.
+
+```{r}
+#| label: fig-rank-hist-fit
+#| fig-cap: Rank histogram of the posterior distributions of selected model parameters.
+as_draws(fit) |>  mcmc_rank_hist(
+  pars = c("b_Intercept[1]", "b_stimNAD", "b_trial_number",
+           "b_study_conditiontone", "b_study_conditionspeech",
+           "b_study_conditionspeech_mismatch","b_study_conditiontone_mismatch"))
+```
+
+@tbl-summ-fit shows the posterior distributions of $b(stimNAD)+b(study\;condition\;tone:stimNAD)$, 
+$b(stimNAD)+b(study\;condition\;speech:stimNAD)$,$b(stimNAD)+b(study\;condition\;tone\;mismatch:stimNAD)$,
+$b(stimNAD)+b(study\;condition\;speech\;mismatch:stimNAD)$, which indicate how much higher score for NAD stimuli vs. positional stimuli, or if the participant learns the NAD pattern correctly.
+
+```{r}
+#| label: tbl-summ-fit
+#| tbl-cap: Posterior summary of the model parameters.
+summ_fit <- as_draws(fit) |>
+    subset_draws(variable = c(
+      "b_stimNAD", "b_study_conditiontone:stimNAD", 
+      "b_study_conditionspeech:stimNAD", 
+      "b_study_conditiontone_mismatch:stimNAD",
+      "b_study_conditionspeech_mismatch:stimNAD")) |>
+    mutate_variables(
+      `NAD silent`=b_stimNAD,
+      `NAD tone`=b_stimNAD+`b_study_conditiontone:stimNAD`,
+      `NAD speech`=b_stimNAD+`b_study_conditionspeech:stimNAD`,
+      `NAD tone mismatch`=b_stimNAD+`b_study_conditiontone_mismatch:stimNAD`,
+      `NAD speech mismatch`=b_stimNAD+`b_study_conditionspeech_mismatch:stimNAD`
+                     ) |>
+    subset_draws(variable = c(
+      "NAD silent","NAD tone","NAD speech",
+      "NAD tone mismatch","NAD speech mismatch")) |>
+    summarise_draws()
+knitr::kable(summ_fit, digits = 2)
+```
+
+The analysis showed that on silent condition and the two mismatch condition, participants fail to learn the NAD pattern since they cannot tell the difference between NAD stimuli vs. positional stimuli. However, in the tone condition and speech condition, participants can learn the NAD pattern with the posterior mean of `r round(summ_fit$mean[2], 2)` and `r round(summ_fit$mean[3], 2)` separately, and a 90% CI of [`r round(summ_fit$q5[2], 2)`, `r round(summ_fit$q95[2], 2)`] and [`r round(summ_fit$q5[3], 2)`, `r round(summ_fit$q95[3], 2)`] separately.
